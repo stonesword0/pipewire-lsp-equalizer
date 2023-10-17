@@ -1,0 +1,68 @@
+#!/bin/bash
+# Created by Ethan Fitterer (c) 2023
+# Hosted on https://git.ethanf.xyz/ethan/pipewire-lsp-equalizer
+# See liscense in LISCENSE
+# Set default command on line 26
+set -e
+
+if [ "$1" = "--help" ]; then
+	cat << EOF
+Usage: pipewire-lsp-equalizer [options]
+	All options are passed to lsp-plugins-para-equalizer-x16-stereo
+	Default command can be set in the script 
+
+$(lsp-plugins-para-equalizer-x16-stereo --help)
+EOF
+	exit 0
+fi
+
+PRE_DEFAULT_SOURCE=`pactl get-default-source`
+PRE_DEFAULT_SINK=`pw-dump | jq ".[] | select(.info.props.[\"node.name\"]==\"$(pactl get-default-sink)\") | .info.props.[\"alsa.card_name\"]"`
+
+# launch the loopback and equalizer
+pw-loopback -n 'Equalizer' -m '[ FL FR ]' --capture-props='node.name=EqualizerSink media.class=Audio/Sink' --playback-props='media.class=Audio/Source node.name=EqualizerSource node.target=para_equalizer_x16_stereo' &
+LOOPBACK_PID="$!"
+if [ -n $@ ]; then
+	lsp-plugins-para-equalizer-x16-stereo -c "${HOME}/.config/eq.cfg" & # default command - will be ran when no args are passed
+else
+	lsp-plugins-para-equalizer-x16-stereo $@ &
+fi
+
+EQ_PID="$!"
+
+sleep 1 # wait for stuff to load, increase increase if stuff isn't working
+
+# get all the port ids
+LOOPBACK_SOURCE_L=`pw-dump | jq '.[] | select(.type=="PipeWire:Interface:Port") | select(.info.props.["object.path"] | startswith("EqualizerSource")) | select(.info.props.["port.name"]=="capture_FL") | .id'`
+LOOPBACK_SOURCE_R=`pw-dump | jq '.[] | select(.type=="PipeWire:Interface:Port") | select(.info.props.["object.path"] | startswith("EqualizerSource")) | select(.info.props.["port.name"]=="capture_FR") | .id'`
+
+EQ_SINK_L=`pw-dump | jq '.[] | select(.type=="PipeWire:Interface:Port") | select(.info.props.["object.path"] | startswith("para_equalizer")) | select(.info.props.["port.name"]=="in_l") | .id'`
+EQ_SINK_R=`pw-dump | jq '.[] | select(.type=="PipeWire:Interface:Port") | select(.info.props.["object.path"] | startswith("para_equalizer")) | select(.info.props.["port.name"]=="in_r") | .id'`
+
+EQ_SOURCE_L=`pw-dump | jq '.[] | select(.type=="PipeWire:Interface:Port") | select(.info.props.["object.path"] | startswith("para_equalizer")) | select(.info.props.["port.name"]=="out_l") | .id'`
+EQ_SOURCE_R=`pw-dump | jq '.[] | select(.type=="PipeWire:Interface:Port") | select(.info.props.["object.path"] | startswith("para_equalizer")) | select(.info.props.["port.name"]=="out_r") | .id'`
+
+DEVICE_SINK_L=`pw-dump | jq ".[] | select(.type==\"PipeWire:Interface:Port\") | select(.info.props.[\"port.alias\"] | startswith(${PRE_DEFAULT_SINK})) | select(.info.props.[\"port.name\"]==\"playback_FL\") | .id"`
+DEVICE_SINK_R=`pw-dump | jq ".[] | select(.type==\"PipeWire:Interface:Port\") | select(.info.props.[\"port.alias\"] | startswith(${PRE_DEFAULT_SINK})) | select(.info.props.[\"port.name\"]==\"playback_FR\") | .id"`
+
+# connect them
+pw-link ${LOOPBACK_SOURCE_L} ${EQ_SINK_L}
+pw-link ${LOOPBACK_SOURCE_R} ${EQ_SINK_R}
+
+pw-link ${EQ_SOURCE_L} ${DEVICE_SINK_L}
+pw-link ${EQ_SOURCE_R} ${DEVICE_SINK_R}
+
+# the loopback creates a source aswell, which sometimes is set as the default source (????)
+pactl set-default-source "${PRE_DEFAULT_SOURCE}"
+
+echo "Equalizer PID: ${EQ_PID}, Loopback PID: ${LOOPBACK_PID}"
+wait -np PID # <3 bash
+
+if [ "${PID}" = "${EQ_PID}" ]; then
+	echo "Equalizer closed. Exiting..."
+	kill "${LOOPBACK_PID}"
+else
+	echo "Loopback closed (crashed?). Exiting..."
+	kill "${EQ_PID}"
+fi
+
